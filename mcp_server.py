@@ -12,6 +12,7 @@ Tools exposed:
   USERS   — list_users, create_user, switch_user
   PROFILE — get_user_context, set_user_profile, set_user_state, end_user_state
   READ    — get_data_overview, query_insights, query_canonical, query_evidence, query_raw
+  GRAPH   — add_entity, add_edge, query_cause_chain, get_entity_neighborhood, search_entities
   WRITE   — ingest_evidence, create_insight, upsert_canonical, store_document, ingest_lab_json
 """
 
@@ -28,6 +29,7 @@ from app.dal import profile as profile_dal
 from app.database import get_db
 from app.ingestion import pipeline as ingest_pipeline
 from app.dal import users as users_dal
+from app.dal import graph as graph_dal
 
 mcp = FastMCP(
     name="Health Connector",
@@ -67,13 +69,35 @@ abnormal flags, dates, and the document source.
 For structured JSON exports, do NOT read them as text — pass the dict directly to
 `ingest_lab_json`. The parser handles field mapping automatically.
 
-## Step 4 — Query layers top-down, stop when you have enough
-1. **Insights**  — Past high-level analysis: trends, correlations, anomalies.
-2. **Canonical** — Per-topic aggregated summaries (day / week / month). Topics are flexible strings.
-3. **Evidence**  — Individual normalized data points with exact timestamps and values.
-4. **Raw**       — Original source files. Last resort only.
+## Step 4 — Query layers (Canonical + Graph in parallel, top-down for evidence)
 
-## Step 5 — Save analysis results
+**Canonical layer** — trend summaries by topic and period:
+1. `query_insights`  — past high-level analysis, trends, correlations
+2. `query_canonical` — aggregated topic summaries (day / week / month)
+3. `query_evidence`  — individual data points with exact values and timestamps
+4. `query_raw`       — original source files, last resort only
+
+**Graph layer** — knowledge graph for root cause and effect tracing:
+- `search_entities`         — find entities before querying the graph
+- `get_entity_neighborhood` — see everything connected to one entity (one hop)
+- `query_cause_chain`       — traverse causal chains upstream or downstream
+
+Query Canonical AND Graph in parallel when doing analysis — they provide complementary information:
+- Canonical answers "what happened and when" (trend data)
+- Graph answers "why it happened and what it caused" (causal structure)
+
+## Step 5 — Build the graph as you analyse
+After identifying relationships during analysis, always persist them:
+- `add_entity` — register any new biomarker, symptom, condition, or event encountered
+- `add_edge`   — persist every causal or correlational relationship you infer
+
+Good edges to add:
+  - abnormal lab result → condition it indicates
+  - user_state (surgery, training) → biomarker it affects
+  - symptom → biomarker that correlates with it
+  - intervention → condition it resolves
+
+## Step 6 — Save narrative results
 After meaningful analysis call `create_insight` to persist findings.
 If you derive a useful topic summary call `upsert_canonical`.
 """.strip(),
@@ -679,6 +703,185 @@ def ingest_lab_json(
         user_id=_uid(),
         raw_json=lab_json,
         extra_tags=extra_tags,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH tools  (entities + causal edges)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_entity(
+    entity_type: str,
+    label: str,
+    properties: dict | None = None,
+) -> dict:
+    """
+    Add or update an entity node in the health knowledge graph.
+    Safe to call multiple times — merges properties on conflict.
+
+    Entity types:
+        "biomarker"    — measurable lab/wearable metric: WBC, HRV, weight, creatinine
+        "symptom"      — subjective complaint: 疲劳, 头痛, 失眠, 食欲不振
+        "condition"    — diagnosis or state: 术后炎症, 高血压, 贫血, 低血糖
+        "intervention" — treatment or action: 阿莫西林, 低碳饮食, 有氧训练
+        "lifestyle"    — environmental factor: 睡眠不足, 高压工作, 久坐
+        "event"        — discrete occurrence: 阑尾切除术, 马拉松比赛, 献血
+
+    Args:
+        entity_type: One of the types above
+        label:       Canonical name, e.g. "WBC", "术后炎症反应"
+        properties:  Optional flexible dict, e.g. {"unit": "10^3/uL", "normal_range": "4-10"}
+    """
+    return graph_dal.upsert_entity(
+        user_id=_uid(),
+        entity_type=entity_type,
+        label=label,
+        properties=properties,
+    )
+
+
+@mcp.tool()
+def add_edge(
+    source_type: str,
+    source_label: str,
+    relationship: str,
+    target_type: str,
+    target_label: str,
+    confidence: float = 0.7,
+    explanation: str | None = None,
+    evidence_ids: list[str] | None = None,
+    observed_at: str | None = None,
+) -> dict:
+    """
+    Add or update a directed relationship between two entities.
+    Entities are auto-created if they don't exist.
+
+    Direction: source --relationship--> target
+    Example:   "术后炎症" --causes--> "WBC升高"
+               "WBC升高"  --correlates_with--> "疲劳"
+
+    Relationship types:
+        "causes"          — A directly causes B (strong causal claim)
+        "correlates_with" — A and B co-occur or are statistically linked
+        "triggered_by"    — A was triggered by B (event → response)
+        "worsens"         — A makes B worse
+        "resolves"        — A treats or resolves B
+        "indicates"       — A is a clinical indicator of B (biomarker → condition)
+        "precedes"        — A temporally precedes B (no causality claimed)
+
+    Args:
+        source_type:  Entity type of the source node
+        source_label: Label of the source node
+        relationship: One of the relationship types above
+        target_type:  Entity type of the target node
+        target_label: Label of the target node
+        confidence:   0.0–1.0, your confidence in this relationship
+        explanation:  One-sentence rationale for this relationship
+        evidence_ids: UUIDs of evidence rows that support this edge
+        observed_at:  ISO date when this relationship was observed "YYYY-MM-DD"
+    """
+    return graph_dal.upsert_edge(
+        user_id=_uid(),
+        source_entity_type=source_type,
+        source_label=source_label,
+        target_entity_type=target_type,
+        target_label=target_label,
+        relationship=relationship,
+        confidence=confidence,
+        explanation=explanation,
+        evidence_ids=evidence_ids,
+        observed_at=observed_at,
+    )
+
+
+@mcp.tool()
+def query_cause_chain(
+    entity_type: str,
+    label: str,
+    direction: str = "upstream",
+    max_depth: int = 3,
+) -> dict:
+    """
+    Traverse the knowledge graph from a focal entity to find causal chains.
+
+    Use this for root cause analysis and effect tracing.
+
+    upstream   → "what caused this?"   — follow incoming causal edges
+    downstream → "what does this cause?" — follow outgoing causal edges
+
+    Example queries:
+        query_cause_chain("biomarker", "WBC", direction="upstream")
+        → 术后炎症 --causes--> WBC升高 (depth 1)
+          阑尾切除术 --triggered_by--> 术后炎症 (depth 2)
+
+        query_cause_chain("symptom", "疲劳", direction="upstream")
+        → WBC升高 --correlates_with--> 疲劳
+          睡眠不足 --worsens--> 疲劳
+
+    Args:
+        entity_type: Type of the focal entity
+        label:       Label of the focal entity
+        direction:   "upstream" (find causes) or "downstream" (find effects)
+        max_depth:   How many hops to traverse (default 3, max 5)
+
+    Returns:
+        focal_entity, direction, chain (list of edges with depth), summary (plain text)
+    """
+    return graph_dal.query_cause_chain(
+        user_id=_uid(),
+        entity_type=entity_type,
+        label=label,
+        direction=direction,
+        max_depth=min(max_depth, 5),
+    )
+
+
+@mcp.tool()
+def get_entity_neighborhood(
+    entity_type: str,
+    label: str,
+    relationship: str | None = None,
+) -> dict:
+    """
+    Return all edges directly connected to an entity (one hop, both directions).
+
+    Use this to see everything the graph knows about a specific entity.
+
+    Args:
+        entity_type:  Type of the focal entity
+        label:        Label of the focal entity
+        relationship: Optional filter, e.g. "causes" to see only causal edges
+
+    Returns:
+        entity, outgoing edges (what it affects), incoming edges (what affects it)
+    """
+    return graph_dal.get_neighborhood(
+        user_id=_uid(),
+        entity_type=entity_type,
+        label=label,
+        relationship=relationship,
+    )
+
+
+@mcp.tool()
+def search_entities(
+    query: str | None = None,
+    entity_type: str | None = None,
+) -> list[dict]:
+    """
+    Search for entities in the knowledge graph by label or type.
+
+    Use this to find an entity before querying its neighborhood or cause chain.
+
+    Args:
+        query:       Partial label to match, e.g. "WBC", "炎症", "疲劳"
+        entity_type: Filter to one type, e.g. "biomarker" | "symptom" | "condition"
+    """
+    return graph_dal.search_entities(
+        user_id=_uid(),
+        query=query,
+        entity_type=entity_type,
     )
 
 
