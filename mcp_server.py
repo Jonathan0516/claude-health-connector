@@ -893,21 +893,60 @@ def _make_http_app():
     """
     Build the ASGI app for HTTP mode.
 
-    Wraps FastMCP's SSE app with UserIdMiddleware so each connection's
-    ?user_id= query param is injected into the ContextVar for that request.
+    Architecture:
+        Starlette router
+          ├── Auth routes  (/.well-known/..., /authorize, /callback, /token, /me)
+          └── MCP SSE app  (/sse, /messages)  ← wrapped with JWTMiddleware
 
-    URL format for testers:
-        https://your-server.com/mcp?user_id=<their-uuid>
+    Authentication flow:
+        1. Claude.ai discovers OAuth metadata at /.well-known/oauth-authorization-server
+        2. User clicks Connect → redirected to /authorize → Google login
+        3. /callback: exchange code → create/find user → issue JWT
+        4. Claude.ai sends Bearer <JWT> on every MCP request
+        5. JWTMiddleware validates token → sets _request_user_id ContextVar
 
-    The UUID acts as a lightweight access token for internal testing.
-    Anyone who knows their UUID can access only their own data.
+    Fallback (no JWT):
+        If JWT_SECRET is empty, falls back to ?user_id= query param for
+        quick local testing without Google OAuth configured.
     """
+    import jwt as pyjwt
+    from starlette.applications import Starlette
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
+    from starlette.routing import Mount
+    from app.auth.routes import AUTH_ROUTES
+    from app.auth import jwt_utils
 
-    class UserIdMiddleware(BaseHTTPMiddleware):
+    class JWTMiddleware(BaseHTTPMiddleware):
+        """
+        Extract user_id from Bearer JWT or fall back to ?user_id= query param.
+        Unauthenticated requests to /sse or /messages get a 401.
+        Auth routes are always public.
+        """
+        PUBLIC_PREFIXES = ("/.well-known", "/authorize", "/callback", "/token", "/me")
+
         async def dispatch(self, request: Request, call_next):
-            uid = request.query_params.get("user_id") or settings.default_user_id
+            path = request.url.path
+
+            # Auth endpoints are always public
+            if any(path.startswith(p) for p in self.PUBLIC_PREFIXES):
+                return await call_next(request)
+
+            uid = None
+
+            # Try Bearer JWT first (production)
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer ") and settings.jwt_secret:
+                try:
+                    uid = jwt_utils.validate_token(auth_header[7:])
+                except pyjwt.PyJWTError:
+                    from starlette.responses import JSONResponse
+                    return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
+
+            # Fallback: ?user_id= for quick internal testing
+            if not uid:
+                uid = request.query_params.get("user_id") or settings.default_user_id
+
             token = _request_user_id.set(uid)
             try:
                 response = await call_next(request)
@@ -915,9 +954,14 @@ def _make_http_app():
                 _request_user_id.reset(token)
             return response
 
-    base_app = mcp.sse_app()
-    base_app.add_middleware(UserIdMiddleware)
-    return base_app
+    mcp_asgi = mcp.sse_app()
+
+    app = Starlette(routes=[
+        *AUTH_ROUTES,
+        Mount("/", app=mcp_asgi),
+    ])
+    app.add_middleware(JWTMiddleware)
+    return app
 
 
 if __name__ == "__main__":
