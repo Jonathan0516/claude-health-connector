@@ -21,6 +21,8 @@ import contextvars
 from datetime import date
 from mcp.server.fastmcp import FastMCP
 from app.config import settings
+from app.auth import jwt_utils
+from app.auth.routes import AUTH_ROUTES
 from app.dal import evidence as evidence_dal
 from app.dal import canonical as canonical_dal
 from app.dal import insights as insights_dal
@@ -106,7 +108,7 @@ If you derive a useful topic summary call `upsert_canonical`.
 # ── User context ──────────────────────────────────────────────────────────────
 # stdio mode  : _active_user_id is a simple mutable string; switch_user() sets it.
 # HTTP mode   : _request_user_id is a ContextVar populated per-request from
-#               the ?user_id= query param, giving each connection its own user.
+#               the validated Bearer JWT, giving each connection its own user.
 #               switch_user() is intentionally disabled in HTTP mode.
 
 _active_user_id: str = settings.default_user_id          # stdio / switch_user fallback
@@ -893,75 +895,65 @@ def _make_http_app():
     """
     Build the ASGI app for HTTP mode.
 
-    Architecture:
-        Starlette router
-          ├── Auth routes  (/.well-known/..., /authorize, /callback, /token, /me)
-          └── MCP SSE app  (/sse, /messages)  ← wrapped with JWTMiddleware
-
-    Authentication flow:
-        1. Claude.ai discovers OAuth metadata at /.well-known/oauth-authorization-server
-        2. User clicks Connect → redirected to /authorize → Google login
-        3. /callback: exchange code → create/find user → issue JWT
-        4. Claude.ai sends Bearer <JWT> on every MCP request
-        5. JWTMiddleware validates token → sets _request_user_id ContextVar
-
-    Fallback (no JWT):
-        If JWT_SECRET is empty, falls back to ?user_id= query param for
-        quick local testing without Google OAuth configured.
+    Combines:
+    - public OAuth routes used by Claude.ai to obtain a token
+    - protected MCP SSE routes that require a valid Bearer JWT
     """
-    import jwt as pyjwt
     from starlette.applications import Starlette
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.routing import Mount
-    from app.auth.routes import AUTH_ROUTES
-    from app.auth import jwt_utils
+    from starlette.responses import JSONResponse
+    from starlette.routing import BaseRoute
 
-    class JWTMiddleware(BaseHTTPMiddleware):
-        """
-        Extract user_id from Bearer JWT or fall back to ?user_id= query param.
-        Unauthenticated requests to /sse or /messages get a 401.
-        Auth routes are always public.
-        """
-        PUBLIC_PREFIXES = ("/.well-known", "/authorize", "/callback", "/token", "/me")
+    # Pure ASGI middleware — BaseHTTPMiddleware breaks SSE streaming responses.
+    class JWTMiddleware:
+        def __init__(self, app):
+            self.app = app
 
-        async def dispatch(self, request: Request, call_next):
-            path = request.url.path
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                path = scope.get("path", "")
 
-            # Auth endpoints are always public
-            if any(path.startswith(p) for p in self.PUBLIC_PREFIXES):
-                return await call_next(request)
+                # OAuth bootstrap endpoints must stay public.
+                if path in {
+                    "/.well-known/oauth-authorization-server",
+                    "/authorize",
+                    "/callback",
+                    "/token",
+                    "/me",
+                }:
+                    await self.app(scope, receive, send)
+                    return
 
-            uid = None
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+                if not auth_header.startswith("Bearer "):
+                    response = JSONResponse(
+                        {"error": "Missing Bearer token"},
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
 
-            # Try Bearer JWT first (production)
-            auth_header = request.headers.get("authorization", "")
-            if auth_header.startswith("Bearer ") and settings.jwt_secret:
                 try:
                     uid = jwt_utils.validate_token(auth_header[7:])
-                except pyjwt.PyJWTError:
-                    from starlette.responses import JSONResponse
-                    return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
+                except Exception as exc:
+                    response = JSONResponse(
+                        {"error": f"Invalid token: {exc}"},
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
 
-            # Fallback: ?user_id= for quick internal testing
-            if not uid:
-                uid = request.query_params.get("user_id") or settings.default_user_id
+                token = _request_user_id.set(uid)
+                try:
+                    await self.app(scope, receive, send)
+                finally:
+                    _request_user_id.reset(token)
+            else:
+                await self.app(scope, receive, send)
 
-            token = _request_user_id.set(uid)
-            try:
-                response = await call_next(request)
-            finally:
-                _request_user_id.reset(token)
-            return response
-
-    mcp_asgi = mcp.sse_app()
-
-    app = Starlette(routes=[
-        *AUTH_ROUTES,
-        Mount("/", app=mcp_asgi),
-    ])
-    app.add_middleware(JWTMiddleware)
-    return app
+    base_app = mcp.sse_app()
+    routes: list[BaseRoute] = [*AUTH_ROUTES, *base_app.routes]
+    return JWTMiddleware(Starlette(routes=routes))
 
 
 if __name__ == "__main__":
