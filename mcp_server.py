@@ -21,6 +21,8 @@ import contextvars
 from datetime import date
 from mcp.server.fastmcp import FastMCP
 from app.config import settings
+from app.auth import jwt_utils
+from app.auth.routes import AUTH_ROUTES
 from app.dal import evidence as evidence_dal
 from app.dal import canonical as canonical_dal
 from app.dal import insights as insights_dal
@@ -106,7 +108,7 @@ If you derive a useful topic summary call `upsert_canonical`.
 # ── User context ──────────────────────────────────────────────────────────────
 # stdio mode  : _active_user_id is a simple mutable string; switch_user() sets it.
 # HTTP mode   : _request_user_id is a ContextVar populated per-request from
-#               the ?user_id= query param, giving each connection its own user.
+#               the validated Bearer JWT, giving each connection its own user.
 #               switch_user() is intentionally disabled in HTTP mode.
 
 _active_user_id: str = settings.default_user_id          # stdio / switch_user fallback
@@ -893,31 +895,65 @@ def _make_http_app():
     """
     Build the ASGI app for HTTP mode.
 
-    Wraps FastMCP's SSE app with UserIdMiddleware so each connection's
-    ?user_id= query param is injected into the ContextVar for that request.
-
-    URL format for testers:
-        https://your-server.com/mcp?user_id=<their-uuid>
-
-    The UUID acts as a lightweight access token for internal testing.
-    Anyone who knows their UUID can access only their own data.
+    Combines:
+    - public OAuth routes used by Claude.ai to obtain a token
+    - protected MCP SSE routes that require a valid Bearer JWT
     """
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import BaseRoute
 
-    class UserIdMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            uid = request.query_params.get("user_id") or settings.default_user_id
-            token = _request_user_id.set(uid)
-            try:
-                response = await call_next(request)
-            finally:
-                _request_user_id.reset(token)
-            return response
+    # Pure ASGI middleware — BaseHTTPMiddleware breaks SSE streaming responses.
+    class JWTMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                path = scope.get("path", "")
+
+                # OAuth bootstrap endpoints must stay public.
+                if path in {
+                    "/.well-known/oauth-authorization-server",
+                    "/authorize",
+                    "/callback",
+                    "/token",
+                    "/me",
+                }:
+                    await self.app(scope, receive, send)
+                    return
+
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+                if not auth_header.startswith("Bearer "):
+                    response = JSONResponse(
+                        {"error": "Missing Bearer token"},
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                try:
+                    uid = jwt_utils.validate_token(auth_header[7:])
+                except Exception as exc:
+                    response = JSONResponse(
+                        {"error": f"Invalid token: {exc}"},
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                token = _request_user_id.set(uid)
+                try:
+                    await self.app(scope, receive, send)
+                finally:
+                    _request_user_id.reset(token)
+            else:
+                await self.app(scope, receive, send)
 
     base_app = mcp.sse_app()
-    base_app.add_middleware(UserIdMiddleware)
-    return base_app
+    routes: list[BaseRoute] = [*AUTH_ROUTES, *base_app.routes]
+    return JWTMiddleware(Starlette(routes=routes))
 
 
 if __name__ == "__main__":
