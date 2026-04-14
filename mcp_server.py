@@ -32,6 +32,8 @@ from app.database import get_db
 from app.ingestion import pipeline as ingest_pipeline
 from app.dal import users as users_dal
 from app.dal import graph as graph_dal
+from app.web_routes import WEB_API_ROUTES
+import app.web_routes as _web_routes_module
 
 mcp = FastMCP(
     name="Health Connector",
@@ -87,20 +89,52 @@ Query Canonical AND Graph in parallel when doing analysis — they provide compl
 - Canonical answers "what happened and when" (trend data)
 - Graph answers "why it happened and what it caused" (causal structure)
 
-## Step 5 — Build the graph as you analyse
-After identifying relationships during analysis, always persist them:
-- `add_entity` — register any new biomarker, symptom, condition, or event encountered
-- `add_edge`   — persist every causal or correlational relationship you infer
+For any question involving "why", "what causes", "what's the relationship", or
+training/nutrition/symptom analysis: ALWAYS call `search_entities` on the key
+concepts first. The graph may already contain decision paths from prior analyses
+that should inform and constrain your response. Use those paths as your starting
+point before reasoning from general knowledge.
 
-Good edges to add:
-  - abnormal lab result → condition it indicates
-  - user_state (surgery, training) → biomarker it affects
-  - symptom → biomarker that correlates with it
-  - intervention → condition it resolves
+## Step 5 — Maintain the graph: read first, then write only when better
 
-## Step 6 — Save narrative results
-After meaningful analysis call `create_insight` to persist findings.
-If you derive a useful topic summary call `upsert_canonical`.
+The graph is a **living knowledge base of optimised decision paths** — not a log.
+The goal is accuracy and improvement over time, not volume.
+
+### 5a — Always read before writing
+Before finalising any analysis that involves causal or correlational reasoning:
+1. Call `search_entities` to find relevant nodes that already exist.
+2. Call `get_entity_neighborhood` or `query_cause_chain` on those nodes to see
+   what decision paths are already recorded.
+3. Evaluate each existing path: is it still the best explanation?
+
+### 5b — Write ONLY when the graph improves
+Add or update edges in three situations only:
+
+| Situation | Action |
+|-----------|--------|
+| Relationship does not exist yet | `add_entity` + `add_edge` to record the new path |
+| Existing edge exists but your confidence is **higher** | Call `add_edge` again — the upsert upgrades confidence and explanation |
+| Existing explanation is incomplete or wrong | Call `add_edge` with a corrected explanation |
+
+Do NOT call `add_edge` when the existing path already captures the relationship
+at equal or higher confidence — you would degrade rather than improve the graph.
+
+Relationship types (for reference):
+  "causes"          — A directly causes B
+  "correlates_with" — A and B co-occur or are statistically linked
+  "worsens"         — A makes B worse
+  "resolves"        — A treats or resolves B
+  "indicates"       — biomarker → condition it points to
+  "triggered_by"    — event/state → response
+  "precedes"        — temporal link without claiming causality
+
+Confidence guide: 0.5 = weak/speculative, 0.7 = plausible, 0.9 = well-established.
+
+## Step 6 — Save narrative results only when novel
+Call `create_insight` to persist a finding only when it is genuinely new or
+provides a materially better explanation than existing insights (check with
+`query_insights` first). If the finding is already captured, skip.
+If you derive a useful aggregated topic summary, call `upsert_canonical`.
 """.strip(),
 )
 
@@ -854,12 +888,36 @@ def _make_http_app():
     Build the ASGI app for HTTP mode.
 
     Combines:
-    - public OAuth routes used by Claude.ai to obtain a token
-    - protected MCP SSE routes that require a valid Bearer JWT
+    - public OAuth routes + web SPA static files
+    - /api/* REST routes protected by Bearer JWT
+    - MCP SSE routes protected by Bearer JWT
     """
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
-    from starlette.routing import BaseRoute
+    from starlette.routing import BaseRoute, Mount
+    from starlette.staticfiles import StaticFiles
+    import os
+
+    # Share the ContextVar so web_routes can read the authenticated user_id
+    # that JWTMiddleware sets on each request.
+    _web_routes_module._request_user_id = _request_user_id
+
+    # Paths that do NOT require a JWT (OAuth flow + web SPA assets)
+    _PUBLIC_PREFIXES = (
+        "/.well-known/",
+        "/authorize",
+        "/callback",
+        "/token",
+        "/register",
+        "/me",
+        "/app",      # Next.js static export served here
+    )
+
+    _CORS_HEADERS = [
+        (b"access-control-allow-origin",  b"*"),
+        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
+        (b"access-control-allow-headers", b"authorization, content-type"),
+    ]
 
     # Pure ASGI middleware — BaseHTTPMiddleware breaks SSE streaming responses.
     class JWTMiddleware:
@@ -867,66 +925,83 @@ def _make_http_app():
             self.app = app
 
         async def __call__(self, scope, receive, send):
-            if scope["type"] == "http":
-                path = scope.get("path", "")
-
-                # OAuth bootstrap endpoints must stay public.
-                if path in {
-                    "/.well-known/oauth-authorization-server",
-                    "/.well-known/oauth-protected-resource",
-                    "/.well-known/openid-configuration",
-                    "/authorize",
-                    "/callback",
-                    "/token",
-                    "/register",
-                    "/me",
-                }:
-                    await self.app(scope, receive, send)
-                    return
-
-                headers = dict(scope.get("headers", []))
-                auth_header = headers.get(b"authorization", b"").decode()
-                if not auth_header.startswith("Bearer "):
-                    base = settings.base_url.rstrip("/")
-                    response = JSONResponse(
-                        {"error": "Missing Bearer token"},
-                        status_code=401,
-                        headers={
-                            "WWW-Authenticate": (
-                                f'Bearer realm="{base}",'
-                                f' resource_metadata="{base}/.well-known/oauth-protected-resource"'
-                            )
-                        },
-                    )
-                    await response(scope, receive, send)
-                    return
-
-                try:
-                    uid = jwt_utils.validate_token(auth_header[7:])
-                except Exception as exc:
-                    response = JSONResponse(
-                        {"error": f"Invalid token: {exc}"},
-                        status_code=401,
-                    )
-                    await response(scope, receive, send)
-                    return
-
-                token = _request_user_id.set(uid)
-                try:
-                    await self.app(scope, receive, send)
-                finally:
-                    _request_user_id.reset(token)
-            else:
+            if scope["type"] != "http":
                 await self.app(scope, receive, send)
+                return
+
+            path   = scope.get("path", "")
+            method = scope.get("method", "")
+
+            # Inject CORS headers into every response
+            async def send_with_cors(message):
+                if message["type"] == "http.response.start":
+                    message = dict(message)
+                    message["headers"] = list(message.get("headers", [])) + _CORS_HEADERS
+                await send(message)
+
+            # OPTIONS preflight — reply immediately, no JWT needed
+            if method == "OPTIONS":
+                from starlette.responses import Response as PlainResponse
+                response = PlainResponse(status_code=204)
+                await response(scope, receive, send_with_cors)
+                return
+
+            # Public paths bypass JWT check
+            if any(path == p or path.startswith(p) for p in _PUBLIC_PREFIXES):
+                await self.app(scope, receive, send_with_cors)
+                return
+
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode()
+            if not auth_header.startswith("Bearer "):
+                base = settings.base_url.rstrip("/")
+                response = JSONResponse(
+                    {"error": "Missing Bearer token"},
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": (
+                            f'Bearer realm="{base}",'
+                            f' resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                        )
+                    },
+                )
+                await response(scope, receive, send_with_cors)
+                return
+
+            try:
+                uid = jwt_utils.validate_token(auth_header[7:])
+            except Exception as exc:
+                response = JSONResponse(
+                    {"error": f"Invalid token: {exc}"},
+                    status_code=401,
+                )
+                await response(scope, receive, send_with_cors)
+                return
+
+            token = _request_user_id.set(uid)
+            try:
+                await self.app(scope, receive, send_with_cors)
+            finally:
+                _request_user_id.reset(token)
 
     # Use Streamable HTTP transport (MCP 2025-03-26) required by Claude.ai remote MCP.
-    # Mount the handler at "/" so nginx can strip the /health-mcp/ prefix transparently.
-    from starlette.routing import Mount
+    # Web API routes and SPA are mounted before the MCP catch-all at "/".
     mcp.settings.streamable_http_path = "/"
     base_app = mcp.streamable_http_app()
     mcp_handler = base_app.routes[0].app  # Mount("/", handler) → extract handler
 
-    routes: list[BaseRoute] = [*AUTH_ROUTES, Mount("/", app=mcp_handler)]
+    # Static files for the Next.js SPA (built output at web/out)
+    spa_routes: list[BaseRoute] = []
+    spa_dir = os.path.join(os.path.dirname(__file__), "web", "out")
+    if os.path.isdir(spa_dir):
+        spa_routes = [Mount("/app", app=StaticFiles(directory=spa_dir, html=True))]
+
+    routes: list[BaseRoute] = [
+        *AUTH_ROUTES,
+        *WEB_API_ROUTES,   # /api/* before MCP catch-all
+        *spa_routes,
+        Mount("/", app=mcp_handler),
+    ]
     combined = Starlette(
         routes=routes,
         lifespan=lambda _app: mcp.session_manager.run(),
