@@ -9,7 +9,7 @@ Architecture:
   Claude Desktop ←→ MCP Server (this file) ←→ Supabase (Profile + 4-layer DB)
 
 Tools exposed:
-  USERS   — list_users, create_user, switch_user
+  USERS   — list_users, create_user
   PROFILE — get_user_context, set_user_profile, set_user_state, end_user_state
   READ    — get_data_overview, query_insights, query_canonical, query_evidence, query_raw
   GRAPH   — add_entity, add_edge, query_cause_chain, get_entity_neighborhood, search_entities
@@ -35,14 +35,13 @@ from app.dal import graph as graph_dal
 
 mcp = FastMCP(
     name="Health Connector",
+    stateless_http=True,   # No mcp-session-id tracking — survives server restarts
     instructions="""
 You have access to a structured personal health database.
 
-## Step 1 — Identify the active user (every conversation)
-If the person mentions they are someone other than the default user, call `list_users` to find them,
-then `switch_user` to set them as active BEFORE any other tool call.
-If you need to register a new person, call `create_user` first, then `switch_user`.
-Once the correct user is active, call `get_user_context` to get their profile and states.
+## Step 1 — Load the active user context (every conversation)
+The active user is determined automatically from their login. Call `get_user_context` at the start
+of every conversation to load their profile and states.
 Use this as the interpretive frame for ALL subsequent data analysis.
 If the user mentions something new about themselves, call `set_user_profile` or `set_user_state` to persist it.
 
@@ -106,20 +105,17 @@ If you derive a useful topic summary call `upsert_canonical`.
 )
 
 # ── User context ──────────────────────────────────────────────────────────────
-# stdio mode  : _active_user_id is a simple mutable string; switch_user() sets it.
-# HTTP mode   : _request_user_id is a ContextVar populated per-request from
-#               the validated Bearer JWT, giving each connection its own user.
-#               switch_user() is intentionally disabled in HTTP mode.
-
-_active_user_id: str = settings.default_user_id          # stdio / switch_user fallback
-_request_user_id: contextvars.ContextVar[str | None] = (  # HTTP per-request override
+_request_user_id: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar("_request_user_id", default=None)
 )
 
 
 def _uid() -> str:
-    """Return the active user UUID for the current request/session."""
-    return _request_user_id.get() or _active_user_id
+    """Return the active user UUID for the current request (from JWT)."""
+    uid = _request_user_id.get()
+    if not uid:
+        raise ValueError("No authenticated user for this request")
+    return uid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,44 +254,6 @@ def create_user(display_name: str, email: str | None = None) -> dict:
     return users_dal.create_user(display_name=display_name, email=email)
 
 
-@mcp.tool()
-def switch_user(user_id: str | None = None, display_name: str | None = None) -> dict:
-    """
-    Switch the active user for this session.
-
-    All subsequent tool calls (queries, writes, profile) will operate on
-    the switched-to user's data until switch_user() is called again or
-    the MCP server restarts (which resets to DEFAULT_USER_ID).
-
-    Provide either user_id (UUID) or display_name (resolved by lookup).
-    If both are provided, user_id takes precedence.
-
-    Args:
-        user_id:      UUID of the target user
-        display_name: Display name to look up (case-insensitive, first match)
-
-    Returns:
-        {"active_user_id": "...", "display_name": "..."}
-    """
-    global _active_user_id
-
-    if user_id:
-        user = users_dal.get_user(user_id)
-        if not user:
-            return {"error": f"User not found: {user_id}"}
-    elif display_name:
-        user = users_dal.get_user_by_name(display_name)
-        if not user:
-            return {"error": f"No user found with display_name '{display_name}'"}
-    else:
-        return {"error": "Provide either user_id or display_name"}
-
-    _active_user_id = user["id"]
-    return {
-        "active_user_id": _active_user_id,
-        "display_name":   user.get("display_name"),
-        "message": f"Now operating as '{user.get('display_name')}'. All tool calls will use this user's data.",
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -915,9 +873,12 @@ def _make_http_app():
                 # OAuth bootstrap endpoints must stay public.
                 if path in {
                     "/.well-known/oauth-authorization-server",
+                    "/.well-known/oauth-protected-resource",
+                    "/.well-known/openid-configuration",
                     "/authorize",
                     "/callback",
                     "/token",
+                    "/register",
                     "/me",
                 }:
                     await self.app(scope, receive, send)
@@ -926,9 +887,16 @@ def _make_http_app():
                 headers = dict(scope.get("headers", []))
                 auth_header = headers.get(b"authorization", b"").decode()
                 if not auth_header.startswith("Bearer "):
+                    base = settings.base_url.rstrip("/")
                     response = JSONResponse(
                         {"error": "Missing Bearer token"},
                         status_code=401,
+                        headers={
+                            "WWW-Authenticate": (
+                                f'Bearer realm="{base}",'
+                                f' resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                            )
+                        },
                     )
                     await response(scope, receive, send)
                     return
@@ -951,9 +919,19 @@ def _make_http_app():
             else:
                 await self.app(scope, receive, send)
 
-    base_app = mcp.sse_app()
-    routes: list[BaseRoute] = [*AUTH_ROUTES, *base_app.routes]
-    return JWTMiddleware(Starlette(routes=routes))
+    # Use Streamable HTTP transport (MCP 2025-03-26) required by Claude.ai remote MCP.
+    # Mount the handler at "/" so nginx can strip the /health-mcp/ prefix transparently.
+    from starlette.routing import Mount
+    mcp.settings.streamable_http_path = "/"
+    base_app = mcp.streamable_http_app()
+    mcp_handler = base_app.routes[0].app  # Mount("/", handler) → extract handler
+
+    routes: list[BaseRoute] = [*AUTH_ROUTES, Mount("/", app=mcp_handler)]
+    combined = Starlette(
+        routes=routes,
+        lifespan=lambda _app: mcp.session_manager.run(),
+    )
+    return JWTMiddleware(combined)
 
 
 if __name__ == "__main__":

@@ -1,23 +1,23 @@
 """
-OAuth 2.0 authorization server endpoints.
+OAuth 2.0 authorization server endpoints — PKCE authorization code flow.
 
-Mounted on the FastMCP ASGI app at startup.
-
-Endpoints
-─────────
-GET  /.well-known/oauth-authorization-server  → OAuth metadata (MCP discovery)
-GET  /authorize                               → redirect to Google login
-GET  /callback                                → handle Google callback, issue JWT
-GET  /me                                      → return current user info (debug)
-
-After successful login the browser receives a page that delivers the JWT
-back to Claude.ai via the standard OAuth authorization_code flow.
+Flow
+────
+1. Claude.ai → GET /authorize?redirect_uri=...&state=...&code_challenge=...
+2. We save those params (keyed by internal_state), redirect user to Google.
+3. Google → GET /callback?code=...&state=internal_state
+4. We exchange Google code → get user → issue short-lived auth_code
+   → redirect to Claude.ai's redirect_uri?code=auth_code&state=original_state
+5. Claude.ai → POST /token  {code, code_verifier}
+6. We verify PKCE, return JWT as access_token.
 """
 
 from __future__ import annotations
 
-import json
+import base64
+import hashlib
 import secrets
+import time
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
@@ -30,34 +30,38 @@ from app.dal import users as users_dal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# In-memory stores (single-process; fine for this deployment)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# state → {client_state, redirect_uri, code_challenge, code_challenge_method, expires_at}
+_pending: dict[str, dict] = {}
+
+# auth_code → {user_id, code_challenge, code_challenge_method, expires_at}
+_codes: dict[str, dict] = {}
+
+_PENDING_TTL = 600   # 10 min for user to complete login
+_CODE_TTL    = 120   # 2 min to exchange code for token
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _redirect_uri() -> str:
+def _google_callback_uri() -> str:
     return f"{settings.base_url.rstrip('/')}/callback"
 
 
-def _oauth_not_configured() -> JSONResponse:
-    return JSONResponse(
-        {"error": "Google OAuth not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env"},
-        status_code=503,
-    )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Endpoint handlers
+# Discovery endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def oauth_metadata(request: Request) -> JSONResponse:
-    """
-    MCP OAuth discovery endpoint.
-    Claude.ai reads this to know where to send users for authorization.
-    """
     base = settings.base_url.rstrip("/")
     return JSONResponse({
         "issuer":                                base,
         "authorization_endpoint":                f"{base}/authorize",
         "token_endpoint":                        f"{base}/token",
+        "registration_endpoint":                 f"{base}/register",
         "response_types_supported":              ["code"],
         "grant_types_supported":                 ["authorization_code"],
         "code_challenge_methods_supported":      ["S256"],
@@ -65,54 +69,95 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     })
 
 
-async def authorize(request: Request) -> RedirectResponse:
+async def openid_configuration(request: Request) -> JSONResponse:
+    base = settings.base_url.rstrip("/")
+    return JSONResponse({
+        "issuer":                                base,
+        "authorization_endpoint":                f"{base}/authorize",
+        "token_endpoint":                        f"{base}/token",
+        "registration_endpoint":                 f"{base}/register",
+        "response_types_supported":              ["code"],
+        "grant_types_supported":                 ["authorization_code"],
+        "code_challenge_methods_supported":      ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "subject_types_supported":               ["public"],
+        "id_token_signing_alg_values_supported": ["HS256"],
+    })
+
+
+async def protected_resource_metadata(request: Request) -> JSONResponse:
+    base = settings.base_url.rstrip("/")
+    return JSONResponse({
+        "resource":              base,
+        "authorization_servers": [base],
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OAuth endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def authorize(request: Request) -> RedirectResponse | HTMLResponse:
     """
-    Start Google OAuth flow.
-    Preserves the original OAuth state param from Claude.ai so it can be
-    threaded through the callback intact.
+    Step 1 — Claude.ai sends the user here.
+    Save PKCE params + redirect_uri, then send user to Google.
     """
     if not settings.google_client_id:
-        return HTMLResponse("<h2>OAuth not configured on this server.</h2>", status_code=503)
+        return HTMLResponse("<h2>Google OAuth not configured.</h2>", status_code=503)
 
-    # Pass Claude.ai's state through so it can match the response
-    upstream_state = request.query_params.get("state", secrets.token_urlsafe(16))
+    client_redirect_uri  = request.query_params.get("redirect_uri", "")
+    client_state         = request.query_params.get("state", "")
+    code_challenge       = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
 
-    url = google_oauth.get_auth_url(
+    # Use a fresh internal state so we can look up the pending session in /callback.
+    internal_state = secrets.token_urlsafe(24)
+    _pending[internal_state] = {
+        "client_state":          client_state,
+        "redirect_uri":          client_redirect_uri,
+        "code_challenge":        code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at":            time.time() + _PENDING_TTL,
+    }
+
+    google_url = google_oauth.get_auth_url(
         client_id=settings.google_client_id,
-        redirect_uri=_redirect_uri(),
-        state=upstream_state,
+        redirect_uri=_google_callback_uri(),
+        state=internal_state,
     )
-    return RedirectResponse(url)
+    return RedirectResponse(google_url)
 
 
-async def callback(request: Request) -> HTMLResponse:
+async def callback(request: Request) -> RedirectResponse | HTMLResponse:
     """
-    Google redirects here after login.
-
-    1. Exchange auth code → Google access token
-    2. Fetch user email + name from Google
-    3. Look up user in Supabase (by email), create if new
-    4. Issue a JWT
-    5. Deliver the JWT back to Claude.ai via the OAuth code exchange page
+    Step 3 — Google redirects here with ?code=...&state=internal_state.
+    Exchange Google code → get user → issue auth_code → redirect to Claude.ai.
     """
     if not settings.google_client_id:
-        return _oauth_not_configured()
+        return HTMLResponse("<h2>Google OAuth not configured.</h2>", status_code=503)
 
     error = request.query_params.get("error")
     if error:
         return HTMLResponse(f"<h2>Google login failed: {error}</h2>", status_code=400)
 
-    code  = request.query_params.get("code")
-    state = request.query_params.get("state", "")
-    if not code:
-        return HTMLResponse("<h2>Missing authorization code.</h2>", status_code=400)
+    google_code    = request.query_params.get("code")
+    internal_state = request.query_params.get("state", "")
 
+    if not google_code:
+        return HTMLResponse("<h2>Missing authorization code from Google.</h2>", status_code=400)
+
+    # Retrieve the pending session
+    pending = _pending.pop(internal_state, None)
+    if not pending or pending["expires_at"] < time.time():
+        return HTMLResponse("<h2>Session expired or invalid state. Please try again.</h2>", status_code=400)
+
+    # Exchange Google code for user info
     try:
-        token_data   = await google_oauth.exchange_code(
+        token_data = await google_oauth.exchange_code(
             settings.google_client_id,
             settings.google_client_secret,
-            code,
-            _redirect_uri(),
+            google_code,
+            _google_callback_uri(),
         )
         userinfo = await google_oauth.get_userinfo(token_data["access_token"])
     except Exception as exc:
@@ -120,30 +165,90 @@ async def callback(request: Request) -> HTMLResponse:
 
     email        = userinfo.get("email", "")
     display_name = userinfo.get("name") or email.split("@")[0]
-
-    # Find or create user by email
     user = _find_or_create_user(email, display_name)
-    jwt_token = jwt_utils.issue_token(user["id"])
 
-    # Return a page that delivers the token back to Claude.ai
-    # Claude.ai expects the standard OAuth implicit / code flow response.
-    return HTMLResponse(_success_page(display_name, jwt_token, state))
+    # Issue a short-lived authorization code for Claude.ai to exchange
+    auth_code = secrets.token_urlsafe(32)
+    _codes[auth_code] = {
+        "user_id":               user["id"],
+        "code_challenge":        pending["code_challenge"],
+        "code_challenge_method": pending["code_challenge_method"],
+        "expires_at":            time.time() + _CODE_TTL,
+    }
+
+    # Redirect to Claude.ai's redirect_uri with the code
+    client_redirect = pending["redirect_uri"]
+    client_state    = pending["client_state"]
+
+    if client_redirect:
+        sep = "&" if "?" in client_redirect else "?"
+        return RedirectResponse(
+            f"{client_redirect}{sep}code={auth_code}&state={client_state}",
+            status_code=302,
+        )
+
+    # Fallback: no redirect_uri (e.g. manual testing) — show success page
+    jwt_token = jwt_utils.issue_token(user["id"])
+    return HTMLResponse(_success_page(display_name, jwt_token, client_state))
 
 
 async def token_endpoint(request: Request) -> JSONResponse:
     """
-    OAuth token endpoint — Claude.ai may POST here to exchange a code.
-    We use implicit delivery via the callback page, but expose this
-    endpoint for spec compliance.
+    Step 5 — Claude.ai POSTs {code, code_verifier, grant_type} here.
+    Verify PKCE, return JWT as access_token.
     """
-    body = await request.form()
-    grant_type = body.get("grant_type")
+    try:
+        body = await request.form()
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    grant_type    = body.get("grant_type")
+    code          = body.get("code", "")
+    code_verifier = body.get("code_verifier", "")
+
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    # In our flow the JWT is delivered directly on the callback page.
-    # This endpoint is a no-op stub for spec compliance.
-    return JSONResponse({"error": "use_callback_flow"}, status_code=400)
+    issued = _codes.pop(code, None)
+    if not issued or issued["expires_at"] < time.time():
+        return JSONResponse({"error": "invalid_grant", "error_description": "Code expired or not found"}, status_code=400)
+
+    # Verify PKCE (S256)
+    challenge = issued.get("code_challenge", "")
+    if challenge:
+        computed = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        if computed != challenge:
+            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+    jwt_token = jwt_utils.issue_token(issued["user_id"])
+    return JSONResponse({
+        "access_token": jwt_token,
+        "token_type":   "bearer",
+        "expires_in":   settings.jwt_expire_days * 86400,
+    })
+
+
+async def register_client(request: Request) -> JSONResponse:
+    """RFC 7591 Dynamic Client Registration — accepts any client."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    redirect_uris = body.get("redirect_uris", [])
+    seed      = (redirect_uris[0] if redirect_uris else "default").encode()
+    client_id = "mcp-" + hashlib.sha256(seed).hexdigest()[:16]
+
+    return JSONResponse({
+        "client_id":                  client_id,
+        "client_id_issued_at":        0,
+        "redirect_uris":              redirect_uris,
+        "grant_types":                ["authorization_code"],
+        "response_types":             ["code"],
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
 
 
 async def me(request: Request) -> JSONResponse:
@@ -152,7 +257,6 @@ async def me(request: Request) -> JSONResponse:
     if not auth.startswith("Bearer "):
         return JSONResponse({"error": "No Bearer token"}, status_code=401)
     try:
-        import jwt as pyjwt
         user_id = jwt_utils.validate_token(auth[7:])
         user = users_dal.get_user(user_id)
         return JSONResponse(user or {"error": "user not found"})
@@ -165,7 +269,6 @@ async def me(request: Request) -> JSONResponse:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _find_or_create_user(email: str, display_name: str) -> dict:
-    """Look up user by email; create if this is their first login."""
     db_users = users_dal.list_users()
     for u in db_users:
         if u.get("email") == email:
@@ -174,16 +277,9 @@ def _find_or_create_user(email: str, display_name: str) -> dict:
 
 
 def _success_page(name: str, token: str, state: str) -> str:
-    """
-    HTML page shown after successful login.
-    Delivers the JWT as an access_token to the opener (Claude.ai tab)
-    via postMessage, then closes itself.
-    """
-    payload = json.dumps({
-        "access_token": token,
-        "token_type":   "bearer",
-        "state":        state,
-    })
+    """Fallback page when no redirect_uri is present (e.g. manual testing)."""
+    import json
+    payload = json.dumps({"access_token": token, "token_type": "bearer", "state": state})
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Health Connector — Login successful</title></head>
@@ -191,7 +287,6 @@ def _success_page(name: str, token: str, state: str) -> str:
   <h2>✓ Logged in as {name}</h2>
   <p>You can close this window.</p>
   <script>
-    // Deliver token back to the Claude.ai opener
     if (window.opener) {{
       window.opener.postMessage({payload}, "*");
       setTimeout(() => window.close(), 1500);
@@ -202,13 +297,16 @@ def _success_page(name: str, token: str, state: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Route list — imported by mcp_server._make_http_app()
+# Route list
 # ─────────────────────────────────────────────────────────────────────────────
 
 AUTH_ROUTES = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata),
+    Route("/.well-known/oauth-protected-resource",   protected_resource_metadata),
+    Route("/.well-known/openid-configuration",       openid_configuration),
     Route("/authorize",                               authorize),
     Route("/callback",                                callback),
     Route("/token",                                   token_endpoint, methods=["POST"]),
+    Route("/register",                                register_client, methods=["POST"]),
     Route("/me",                                      me),
 ]
